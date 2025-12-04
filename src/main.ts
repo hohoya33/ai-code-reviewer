@@ -66,19 +66,29 @@ async function getDiff(
   return response.data;
 }
 
+type ReviewComment = { body: string; path: string; position: number };
+type DiffChange = Chunk["changes"][number] & {
+  add?: boolean;
+  normal?: boolean;
+  ln?: number;
+  ln2?: number;
+};
+
 async function analyzeCode(
   parsedDiff: File[],
   prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+): Promise<ReviewComment[]> {
+  const comments: ReviewComment[] = [];
 
   for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
+    if (!file.to || file.to === "/dev/null") continue; // Ignore deleted files
+    const linePositionMap = buildLinePositionMap(file);
+
     for (const chunk of file.chunks) {
       const prompt = createPrompt(file, chunk, prDetails);
       const aiResponse = await getAIResponse(prompt);
       if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
+        const newComments = createComment(file, aiResponse, linePositionMap);
         if (newComments) {
           comments.push(...newComments);
         }
@@ -216,29 +226,79 @@ async function getAIResponse(prompt: string): Promise<Array<{
 
 function createComment(
   file: File,
-  chunk: Chunk,
   aiResponses: Array<{
     lineNumber: string;
     reviewComment: string;
-  }>
-): Array<{ body: string; path: string; line: number }> {
+  }>,
+  linePositionMap: Map<number, number>
+): ReviewComment[] {
+  const path = file.to;
+  if (!path) {
+    return [];
+  }
+
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
+    const lineNumber = Number.parseInt(aiResponse.lineNumber, 10);
+    if (!Number.isFinite(lineNumber)) {
+      core.warning(
+        `Skipping comment for file ${file.to}: invalid line number "${aiResponse.lineNumber}".`
+      );
       return [];
     }
+
+    const position = linePositionMap.get(lineNumber);
+    if (typeof position !== "number") {
+      core.warning(
+        `Skipping comment for file ${file.to}: unable to map line ${lineNumber} to diff position.`
+      );
+      return [];
+    }
+
     return {
       body: aiResponse.reviewComment,
-      path: file.to,
-      line: Number(aiResponse.lineNumber),
+      path,
+      position,
     };
   });
+}
+
+function buildLinePositionMap(file: File): Map<number, number> {
+  const linePositions = new Map<number, number>();
+  let position = 0;
+
+  for (const chunk of file.chunks) {
+    for (const change of chunk.changes) {
+      position += 1;
+      const newLineNumber = getNewLineNumber(change);
+      if (
+        typeof newLineNumber === "number" &&
+        !linePositions.has(newLineNumber)
+      ) {
+        linePositions.set(newLineNumber, position);
+      }
+    }
+  }
+
+  return linePositions;
+}
+
+function getNewLineNumber(change: DiffChange): number | null {
+  if (change.add && typeof change.ln === "number") {
+    return change.ln;
+  }
+
+  if (change.normal && typeof change.ln2 === "number") {
+    return change.ln2;
+  }
+
+  return null;
 }
 
 async function createReviewComment(
   owner: string,
   repo: string,
   pull_number: number,
-  comments: Array<{ body: string; path: string; line: number }>
+  comments: ReviewComment[]
 ): Promise<void> {
   await octokit.pulls.createReview({
     owner,
