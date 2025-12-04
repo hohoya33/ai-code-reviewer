@@ -67,6 +67,12 @@ const genAI = new genai_1.GoogleGenAI({
 });
 const MAX_GENAI_RETRIES = 3;
 const BASE_BACKOFF_DELAY_MS = 1000;
+class QuotaExceededError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "QuotaExceededError";
+    }
+}
 function getPRDetails() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
@@ -101,13 +107,14 @@ function analyzeCode(parsedDiff, prDetails) {
     return __awaiter(this, void 0, void 0, function* () {
         const comments = [];
         for (const file of parsedDiff) {
-            if (file.to === "/dev/null")
+            if (!file.to || file.to === "/dev/null")
                 continue; // Ignore deleted files
+            const linePositionMap = buildLinePositionMap(file);
             for (const chunk of file.chunks) {
                 const prompt = createPrompt(file, chunk, prDetails);
                 const aiResponse = yield getAIResponse(prompt);
                 if (aiResponse) {
-                    const newComments = createComment(file, chunk, aiResponse);
+                    const newComments = createComment(file, aiResponse, linePositionMap);
                     if (newComments) {
                         comments.push(...newComments);
                     }
@@ -202,9 +209,7 @@ function getAIResponse(prompt) {
             catch (error) {
                 const genAIError = error;
                 if (isQuotaError(genAIError)) {
-                    const message = "Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota.";
-                    core.setFailed(message);
-                    throw genAIError;
+                    throw new QuotaExceededError("Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota.");
                 }
                 const shouldRetry = isRetryableError(genAIError);
                 const isLastAttempt = attempt === MAX_GENAI_RETRIES;
@@ -220,17 +225,52 @@ function getAIResponse(prompt) {
         return null;
     });
 }
-function createComment(file, chunk, aiResponses) {
+function createComment(file, aiResponses, linePositionMap) {
+    const path = file.to;
+    if (!path) {
+        return [];
+    }
     return aiResponses.flatMap((aiResponse) => {
-        if (!file.to) {
+        const lineNumber = Number.parseInt(aiResponse.lineNumber, 10);
+        if (!Number.isFinite(lineNumber)) {
+            core.warning(`Skipping comment for file ${file.to}: invalid line number "${aiResponse.lineNumber}".`);
+            return [];
+        }
+        const position = linePositionMap.get(lineNumber);
+        if (typeof position !== "number") {
+            core.warning(`Skipping comment for file ${file.to}: unable to map line ${lineNumber} to diff position.`);
             return [];
         }
         return {
             body: aiResponse.reviewComment,
-            path: file.to,
-            line: Number(aiResponse.lineNumber),
+            path,
+            position,
         };
     });
+}
+function buildLinePositionMap(file) {
+    const linePositions = new Map();
+    let position = 0;
+    for (const chunk of file.chunks) {
+        for (const change of chunk.changes) {
+            position += 1;
+            const newLineNumber = getNewLineNumber(change);
+            if (typeof newLineNumber === "number" &&
+                !linePositions.has(newLineNumber)) {
+                linePositions.set(newLineNumber, position);
+            }
+        }
+    }
+    return linePositions;
+}
+function getNewLineNumber(change) {
+    if (change.add && typeof change.ln === "number") {
+        return change.ln;
+    }
+    if (change.normal && typeof change.ln2 === "number") {
+        return change.ln2;
+    }
+    return null;
 }
 function createReviewComment(owner, repo, pull_number, comments) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -289,6 +329,10 @@ function main() {
     });
 }
 main().catch((error) => {
+    if (error instanceof QuotaExceededError) {
+        core.setFailed(error.message);
+        return;
+    }
     console.error("Error:", error);
     process.exit(1);
 });
