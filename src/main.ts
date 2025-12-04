@@ -15,6 +15,9 @@ const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
 
+const MAX_OPENAI_RETRIES = 3;
+const BASE_BACKOFF_DELAY_MS = 1_000;
+
 interface PRDetails {
   owner: string;
   repo: string;
@@ -78,6 +81,44 @@ async function analyzeCode(
   return comments;
 }
 
+interface OpenAIAPIError extends Error {
+  status?: number;
+  code?: string;
+  type?: string;
+  error?: {
+    message?: string;
+    code?: string;
+    type?: string;
+  };
+}
+
+const transientStatuses = new Set([429, 500, 502, 503, 504]);
+
+function isQuotaError(error: OpenAIAPIError): boolean {
+  const code = error.code ?? error.error?.code;
+  return code === "insufficient_quota";
+}
+
+function isRetryableError(error: OpenAIAPIError): boolean {
+  if (isQuotaError(error)) {
+    return false;
+  }
+  return transientStatuses.has(error.status ?? 0);
+}
+
+function getErrorMessage(error: OpenAIAPIError): string {
+  return error.message ?? error.error?.message ?? "Unknown OpenAI error";
+}
+
+function getBackoffDelayMs(attempt: number): number {
+  const jitter = Math.random() * 200;
+  return BASE_BACKOFF_DELAY_MS * Math.pow(2, attempt) + jitter;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
   return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
@@ -123,27 +164,55 @@ async function getAIResponse(prompt: string): Promise<Array<{
     presence_penalty: 0,
   };
 
-  try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
-    });
+  for (let attempt = 0; attempt <= MAX_OPENAI_RETRIES; attempt++) {
+    try {
+      const response = await openai.chat.completions.create({
+        ...queryConfig,
+        // return JSON if the model supports it:
+        ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
+          ? { response_format: { type: "json_object" } }
+          : {}),
+        messages: [
+          {
+            role: "system",
+            content: prompt,
+          },
+        ],
+      });
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(res).reviews;
-  } catch (error) {
-    console.error("Error:", error);
-    return null;
+      const res = response.choices[0].message?.content?.trim() || "{}";
+      return JSON.parse(res).reviews;
+    } catch (error) {
+      const openAIError = error as OpenAIAPIError;
+
+      if (isQuotaError(openAIError)) {
+        const message =
+          "OpenAI API quota was exceeded. Please check your plan and billing details or provide a key with sufficient quota.";
+        core.setFailed(message);
+        throw openAIError;
+      }
+
+      const shouldRetry = isRetryableError(openAIError);
+      const isLastAttempt = attempt === MAX_OPENAI_RETRIES;
+
+      if (!shouldRetry || isLastAttempt) {
+        console.error("Error:", openAIError);
+        return null;
+      }
+
+      const delayMs = getBackoffDelayMs(attempt);
+      core.warning(
+        `OpenAI request failed (attempt ${attempt + 1}/${
+          MAX_OPENAI_RETRIES + 1
+        }): ${getErrorMessage(
+          openAIError
+        )}. Retrying in ${Math.round(delayMs)}ms...`
+      );
+      await delay(delayMs);
+    }
   }
+
+  return null;
 }
 
 function createComment(
