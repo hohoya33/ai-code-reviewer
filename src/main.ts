@@ -18,6 +18,13 @@ const genAI = new GoogleGenAI({
 const MAX_GENAI_RETRIES = 3;
 const BASE_BACKOFF_DELAY_MS = 1_000;
 
+class QuotaExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "QuotaExceededError";
+  }
+}
+
 interface PRDetails {
   owner: string;
   repo: string;
@@ -179,10 +186,9 @@ async function getAIResponse(prompt: string): Promise<Array<{
       const genAIError = error as GenAIError;
 
       if (isQuotaError(genAIError)) {
-        const message =
-          "Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota.";
-        core.setFailed(message);
-        throw genAIError;
+        throw new QuotaExceededError(
+          "Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota."
+        );
       }
 
       const shouldRetry = isRetryableError(genAIError);
@@ -306,6 +312,11 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (error instanceof QuotaExceededError) {
+    core.setFailed(error.message);
+    return;
+  }
+
   console.error("Error:", error);
   process.exit(1);
 });
