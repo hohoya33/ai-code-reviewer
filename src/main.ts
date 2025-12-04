@@ -1,19 +1,22 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI from "openai";
+import { GoogleGenAI, ApiError } from "@google/genai";
 import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
-const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
+const GOOGLE_GENAI_API_KEY: string = core.getInput("GOOGLE_GENAI_API_KEY");
+const GOOGLE_GENAI_MODEL: string = core.getInput("GOOGLE_GENAI_MODEL");
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
+const genAI = new GoogleGenAI({
+  apiKey: GOOGLE_GENAI_API_KEY,
 });
+
+const MAX_GENAI_RETRIES = 3;
+const BASE_BACKOFF_DELAY_MS = 1_000;
 
 interface PRDetails {
   owner: string;
@@ -78,6 +81,46 @@ async function analyzeCode(
   return comments;
 }
 
+type GenAIError = ApiError | (Error & { status?: number });
+
+const transientStatuses = new Set([408, 429, 500, 502, 503, 504]);
+
+function getStatusCode(error: GenAIError): number {
+  if (error instanceof ApiError) {
+    return error.status;
+  }
+  return typeof error.status === "number" ? error.status : 0;
+}
+
+function isQuotaError(error: GenAIError): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  const status = getStatusCode(error);
+  if (message.includes("quota") || message.includes("billing")) {
+    return true;
+  }
+  return status === 429 && message.includes("exceed");
+}
+
+function isRetryableError(error: GenAIError): boolean {
+  if (isQuotaError(error)) {
+    return false;
+  }
+  return transientStatuses.has(getStatusCode(error));
+}
+
+function getErrorMessage(error: GenAIError): string {
+  return error.message ?? "Unknown Google GenAI error";
+}
+
+function getBackoffDelayMs(attempt: number): number {
+  const jitter = Math.random() * 200;
+  return BASE_BACKOFF_DELAY_MS * Math.pow(2, attempt) + jitter;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
   return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
@@ -114,36 +157,55 @@ async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
-  const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.2,
-    max_tokens: 700,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
+  const requestPayload = {
+    model: GOOGLE_GENAI_MODEL,
+    contents: prompt,
+    config: {
+      temperature: 0.2,
+      maxOutputTokens: 700,
+      topP: 1,
+      frequencyPenalty: 0,
+      presencePenalty: 0,
+      responseMimeType: "application/json",
+    },
   };
 
-  try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
-    });
+  for (let attempt = 0; attempt <= MAX_GENAI_RETRIES; attempt++) {
+    try {
+      const response = await genAI.models.generateContent(requestPayload);
+      const res = response.text ?? "{}";
+      return JSON.parse(res).reviews;
+    } catch (error) {
+      const genAIError = error as GenAIError;
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(res).reviews;
-  } catch (error) {
-    console.error("Error:", error);
-    return null;
+      if (isQuotaError(genAIError)) {
+        const message =
+          "Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota.";
+        core.setFailed(message);
+        throw genAIError;
+      }
+
+      const shouldRetry = isRetryableError(genAIError);
+      const isLastAttempt = attempt === MAX_GENAI_RETRIES;
+
+      if (!shouldRetry || isLastAttempt) {
+        console.error("Error:", genAIError);
+        return null;
+      }
+
+      const delayMs = getBackoffDelayMs(attempt);
+      core.warning(
+        `Google GenAI request failed (attempt ${attempt + 1}/${
+          MAX_GENAI_RETRIES + 1
+        }): ${getErrorMessage(
+          genAIError
+        )}. Retrying in ${Math.round(delayMs)}ms...`
+      );
+      await delay(delayMs);
+    }
   }
+
+  return null;
 }
 
 function createComment(
