@@ -1,21 +1,21 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI from "openai";
+import { GoogleGenAI, ApiError } from "@google/genai";
 import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
-const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
+const GOOGLE_GENAI_API_KEY: string = core.getInput("GOOGLE_GENAI_API_KEY");
+const GOOGLE_GENAI_MODEL: string = core.getInput("GOOGLE_GENAI_MODEL");
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
+const genAI = new GoogleGenAI({
+  apiKey: GOOGLE_GENAI_API_KEY,
 });
 
-const MAX_OPENAI_RETRIES = 3;
+const MAX_GENAI_RETRIES = 3;
 const BASE_BACKOFF_DELAY_MS = 1_000;
 
 interface PRDetails {
@@ -81,33 +81,35 @@ async function analyzeCode(
   return comments;
 }
 
-interface OpenAIAPIError extends Error {
-  status?: number;
-  code?: string;
-  type?: string;
-  error?: {
-    message?: string;
-    code?: string;
-    type?: string;
-  };
+type GenAIError = ApiError | (Error & { status?: number });
+
+const transientStatuses = new Set([408, 429, 500, 502, 503, 504]);
+
+function getStatusCode(error: GenAIError): number {
+  if (error instanceof ApiError) {
+    return error.status;
+  }
+  return typeof error.status === "number" ? error.status : 0;
 }
 
-const transientStatuses = new Set([429, 500, 502, 503, 504]);
-
-function isQuotaError(error: OpenAIAPIError): boolean {
-  const code = error.code ?? error.error?.code;
-  return code === "insufficient_quota";
+function isQuotaError(error: GenAIError): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  const status = getStatusCode(error);
+  if (message.includes("quota") || message.includes("billing")) {
+    return true;
+  }
+  return status === 429 && message.includes("exceed");
 }
 
-function isRetryableError(error: OpenAIAPIError): boolean {
+function isRetryableError(error: GenAIError): boolean {
   if (isQuotaError(error)) {
     return false;
   }
-  return transientStatuses.has(error.status ?? 0);
+  return transientStatuses.has(getStatusCode(error));
 }
 
-function getErrorMessage(error: OpenAIAPIError): string {
-  return error.message ?? error.error?.message ?? "Unknown OpenAI error";
+function getErrorMessage(error: GenAIError): string {
+  return error.message ?? "Unknown Google GenAI error";
 }
 
 function getBackoffDelayMs(attempt: number): number {
@@ -155,57 +157,48 @@ async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
-  const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.2,
-    max_tokens: 700,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
+  const requestPayload = {
+    model: GOOGLE_GENAI_MODEL,
+    contents: prompt,
+    config: {
+      temperature: 0.2,
+      maxOutputTokens: 700,
+      topP: 1,
+      frequencyPenalty: 0,
+      presencePenalty: 0,
+      responseMimeType: "application/json",
+    },
   };
 
-  for (let attempt = 0; attempt <= MAX_OPENAI_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= MAX_GENAI_RETRIES; attempt++) {
     try {
-      const response = await openai.chat.completions.create({
-        ...queryConfig,
-        // return JSON if the model supports it:
-        ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-          ? { response_format: { type: "json_object" } }
-          : {}),
-        messages: [
-          {
-            role: "system",
-            content: prompt,
-          },
-        ],
-      });
-
-      const res = response.choices[0].message?.content?.trim() || "{}";
+      const response = await genAI.models.generateContent(requestPayload);
+      const res = response.text ?? "{}";
       return JSON.parse(res).reviews;
     } catch (error) {
-      const openAIError = error as OpenAIAPIError;
+      const genAIError = error as GenAIError;
 
-      if (isQuotaError(openAIError)) {
+      if (isQuotaError(genAIError)) {
         const message =
-          "OpenAI API quota was exceeded. Please check your plan and billing details or provide a key with sufficient quota.";
+          "Google GenAI quota was exceeded. Please check your plan, billing details, or provide a key with sufficient quota.";
         core.setFailed(message);
-        throw openAIError;
+        throw genAIError;
       }
 
-      const shouldRetry = isRetryableError(openAIError);
-      const isLastAttempt = attempt === MAX_OPENAI_RETRIES;
+      const shouldRetry = isRetryableError(genAIError);
+      const isLastAttempt = attempt === MAX_GENAI_RETRIES;
 
       if (!shouldRetry || isLastAttempt) {
-        console.error("Error:", openAIError);
+        console.error("Error:", genAIError);
         return null;
       }
 
       const delayMs = getBackoffDelayMs(attempt);
       core.warning(
-        `OpenAI request failed (attempt ${attempt + 1}/${
-          MAX_OPENAI_RETRIES + 1
+        `Google GenAI request failed (attempt ${attempt + 1}/${
+          MAX_GENAI_RETRIES + 1
         }): ${getErrorMessage(
-          openAIError
+          genAIError
         )}. Retrying in ${Math.round(delayMs)}ms...`
       );
       await delay(delayMs);
